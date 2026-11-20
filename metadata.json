@@ -1,0 +1,11 @@
+{
+  "name": "CashBridge",
+  "description": "Nearby Cash & Digital Money Exchange Discovery Platform — connect safely with verified neighbors within 1 KM who have opposite cash and UPI needs.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
