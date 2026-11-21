@@ -47,13 +47,14 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           navigateFallback: '/index.html',
-          navigateFallbackDenylist: [/^\/api\//, /^\/ws/],
+          navigateFallbackDenylist: [/^\/api\//, /^\/ws/, /^\/__\/auth\//],
           runtimeCaching: [
             {
-              // Never cache authenticated API requests or private exchange records
-              urlPattern: /\/api\/.*/i,
+              // Never cache authenticated API requests, Firebase Auth calls, reCAPTCHA, or private exchange records
+              urlPattern: /\/api\/.*|^https:\/\/(identitytoolkit|securetoken)\.googleapis\.com\/.*|^https:\/\/(www\.)?(google\.com\/recaptcha|gstatic\.com\/recaptcha|recaptcha\.net)\/.*/i,
               handler: 'NetworkOnly',
             },
             {

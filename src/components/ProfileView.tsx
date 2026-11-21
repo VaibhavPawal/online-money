@@ -16,6 +16,14 @@ import {
 } from 'lucide-react';
 import { NotificationPrefs, UserProfile, UserReview } from '../types';
 import { apiRequest } from '../lib/api';
+import {
+  auth,
+  EmailAuthProvider,
+  reauthenticateWithCredential,
+  updatePassword,
+  deleteUser,
+  formatFirebaseAuthError,
+} from '../lib/firebase';
 import { formatRelativeTime } from '../utils/geo';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -156,19 +164,39 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     }
   };
 
+  const firebaseUser = auth.currentUser;
+  const hasFirebasePasswordProvider = Boolean(
+    firebaseUser?.providerData.some((p) => p.providerId === 'password')
+  );
+  const isExternalFirebaseProviderOnly = Boolean(firebaseUser && !hasFirebasePasswordProvider);
+
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingPassword(true);
     try {
-      const res = await apiRequest<{ message: string }>('/api/auth/change-password', {
-        method: 'POST',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      setCurrentPassword('');
-      setNewPassword('');
-      onToast(res.message);
+      if (firebaseUser && hasFirebasePasswordProvider && firebaseUser.email) {
+        const credential = EmailAuthProvider.credential(firebaseUser.email, currentPassword);
+        await reauthenticateWithCredential(firebaseUser, credential);
+        await updatePassword(firebaseUser, newPassword);
+        setCurrentPassword('');
+        setNewPassword('');
+        onToast('Firebase account password updated successfully.');
+      } else {
+        const res = await apiRequest<{ message: string }>('/api/auth/change-password', {
+          method: 'POST',
+          body: JSON.stringify({ currentPassword, newPassword }),
+        });
+        setCurrentPassword('');
+        setNewPassword('');
+        onToast(res.message);
+      }
     } catch (err: any) {
-      onToast(err.message || 'Could not change password.', 'error');
+      onToast(
+        err?.code?.startsWith?.('auth/')
+          ? formatFirebaseAuthError(err)
+          : err.message || 'Could not change password.',
+        'error'
+      );
     } finally {
       setSavingPassword(false);
     }
@@ -221,6 +249,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     if (deleteConfirmText !== 'DELETE') return;
     try {
       await apiRequest('/api/profile', { method: 'DELETE' });
+      if (auth.currentUser) {
+        await deleteUser(auth.currentUser).catch(() => {});
+      }
       onLogout();
     } catch (err: any) {
       onToast(err.message || 'Could not delete account.', 'error');
@@ -351,46 +382,64 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             </button>
           </form>
 
-          <form onSubmit={handleChangePassword} className="rounded-2xl border border-slate-200 bg-white p-6 space-y-4">
-            <div className="flex items-center gap-2">
-              <Lock className="w-4 h-4 text-[#0B192C]" />
-              <h2 className="text-base font-display font-bold text-[#0B192C]">Change Password</h2>
+          {isExternalFirebaseProviderOnly ? (
+            <div className="rounded-2xl border border-slate-200 bg-white p-6 space-y-2">
+              <div className="flex items-center gap-2">
+                <Lock className="w-4 h-4 text-emerald-600" />
+                <h2 className="text-base font-display font-bold text-[#0B192C]">Account Sign-In Security</h2>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Your account is secured through Firebase Authentication using{' '}
+                <strong>
+                  {firebaseUser?.providerData.some((p) => p.providerId === 'google.com')
+                    ? 'Google Sign-In'
+                    : 'Phone OTP'}
+                </strong>
+                . No separate CashBridge password is stored.
+              </p>
             </div>
-            <div>
-              <label htmlFor="cur-pass" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Current Password
-              </label>
-              <input
-                id="cur-pass"
-                type="password"
-                required
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 text-sm"
-              />
-            </div>
-            <div>
-              <label htmlFor="new-pass" className="block text-xs font-medium text-slate-700 mb-1.5">
-                New Password (8+ characters)
-              </label>
-              <input
-                id="new-pass"
-                type="password"
-                required
-                minLength={8}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 text-sm"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={savingPassword}
-              className="px-5 py-2.5 min-h-[44px] rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
-            >
-              {savingPassword ? 'Updating...' : 'Update Password'}
-            </button>
-          </form>
+          ) : (
+            <form onSubmit={handleChangePassword} className="rounded-2xl border border-slate-200 bg-white p-6 space-y-4">
+              <div className="flex items-center gap-2">
+                <Lock className="w-4 h-4 text-[#0B192C]" />
+                <h2 className="text-base font-display font-bold text-[#0B192C]">Change Password</h2>
+              </div>
+              <div>
+                <label htmlFor="cur-pass" className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Current Password
+                </label>
+                <input
+                  id="cur-pass"
+                  type="password"
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 text-sm"
+                />
+              </div>
+              <div>
+                <label htmlFor="new-pass" className="block text-xs font-medium text-slate-700 mb-1.5">
+                  New Password (8+ characters)
+                </label>
+                <input
+                  id="new-pass"
+                  type="password"
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full min-h-[44px] rounded-xl border border-slate-300 px-3.5 text-sm"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={savingPassword}
+                className="px-5 py-2.5 min-h-[44px] rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
+              >
+                {savingPassword ? 'Updating...' : 'Update Password'}
+              </button>
+            </form>
+          )}
 
           {/* Optional KYC & Danger Zone */}
           <div className="rounded-2xl border border-slate-200 bg-white p-6 space-y-4">

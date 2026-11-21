@@ -16,6 +16,10 @@ import {
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 const ADMIN_BOOTSTRAP_EMAIL = 'pawalvaibhav13@gmail.com';
+const FIREBASE_PROJECT_ID =
+  process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || 'cashbride-fa3b3';
+const FIREBASE_CERTS_URL =
+  'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
 
 // Initialize SQLite database with WAL mode
@@ -194,6 +198,15 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
 `);
 
+// Safe schema migration: add firebase_uid column to existing databases if missing
+const userColumns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+if (!userColumns.some((c) => c.name === 'firebase_uid')) {
+  db.exec('ALTER TABLE users ADD COLUMN firebase_uid TEXT');
+}
+db.exec(
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid) WHERE firebase_uid IS NOT NULL'
+);
+
 // Seed default platform config (INR 500 to INR 25,000 per confirmed user choice)
 const existingConfig = db.prepare('SELECT id FROM platform_config WHERE id = 1').get();
 if (!existingConfig) {
@@ -201,6 +214,131 @@ if (!existingConfig) {
     INSERT INTO platform_config (id, min_amount, max_amount, supported_radii, default_radius, max_active_requests, updated_at)
     VALUES (1, 500, 25000, '[500,1000,2000,5000]', 1000, 3, ?)
   `).run(new Date().toISOString());
+}
+
+// Cryptographic Firebase ID Token (RS256) Verification via Google's official X.509 certificates
+interface VerifiedFirebaseToken {
+  uid: string;
+  email: string | null;
+  emailVerified: boolean;
+  phoneNumber: string | null;
+  name: string | null;
+  picture: string | null;
+  signInProvider: string;
+}
+
+let cachedFirebaseCerts: Record<string, string> = {};
+let firebaseCertsExpiresAt = 0;
+
+async function fetchFirebasePublicCerts(forceRefresh = false): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (!forceRefresh && firebaseCertsExpiresAt > now && Object.keys(cachedFirebaseCerts).length > 0) {
+    return cachedFirebaseCerts;
+  }
+  const resp = await fetch(FIREBASE_CERTS_URL);
+  if (!resp.ok) {
+    throw new Error('Unable to fetch Firebase verification certificates.');
+  }
+  const cacheControl = resp.headers.get('cache-control') || '';
+  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+  const maxAgeSec = maxAgeMatch ? Math.min(Number(maxAgeMatch[1]), 86400) : 3600;
+  const certs = (await resp.json()) as Record<string, string>;
+  cachedFirebaseCerts = certs;
+  firebaseCertsExpiresAt = now + maxAgeSec * 1000;
+  return certs;
+}
+
+async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseToken> {
+  if (!idToken || typeof idToken !== 'string') {
+    throw new Error('Missing Firebase ID token.');
+  }
+  const parts = idToken.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Malformed Firebase ID token.');
+  }
+  const [headerB64, payloadB64, signatureB64] = parts;
+  let header: any;
+  let payload: any;
+  try {
+    header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  } catch {
+    throw new Error('Invalid Firebase token encoding.');
+  }
+
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid) {
+    throw new Error('Unsupported Firebase token signing algorithm.');
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expectedIss = `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`;
+  if (payload.aud !== FIREBASE_PROJECT_ID) {
+    throw new Error('Firebase token project audience mismatch.');
+  }
+  if (payload.iss !== expectedIss) {
+    throw new Error('Firebase token issuer mismatch.');
+  }
+  if (typeof payload.sub !== 'string' || payload.sub.length === 0 || payload.sub.length > 128) {
+    throw new Error('Firebase token missing valid subject.');
+  }
+  if (typeof payload.exp !== 'number' || payload.exp <= nowSec - 30) {
+    throw new Error('Firebase authentication token has expired. Please sign in again.');
+  }
+  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
+    throw new Error('Firebase token issued-at timestamp is invalid.');
+  }
+
+  let certs = await fetchFirebasePublicCerts(false);
+  let cert = certs[header.kid];
+  if (!cert) {
+    certs = await fetchFirebasePublicCerts(true);
+    cert = certs[header.kid];
+  }
+  if (!cert) {
+    throw new Error('Unknown Firebase signing key.');
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const signature = Buffer.from(signatureB64, 'base64url');
+  if (!verifier.verify(cert, signature)) {
+    throw new Error('Firebase token signature verification failed.');
+  }
+
+  return {
+    uid: payload.sub,
+    email: typeof payload.email === 'string' ? payload.email.trim().toLowerCase() : null,
+    emailVerified: Boolean(payload.email_verified),
+    phoneNumber: typeof payload.phone_number === 'string' ? payload.phone_number : null,
+    name: typeof payload.name === 'string' ? payload.name.trim() : null,
+    picture: typeof payload.picture === 'string' ? payload.picture.trim() : null,
+    signInProvider:
+      typeof payload.firebase?.sign_in_provider === 'string'
+        ? payload.firebase.sign_in_provider
+        : 'unknown',
+  };
+}
+
+function validateSafeProfileImage(value: unknown): string | null | 'INVALID' {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') return 'INVALID';
+  if (value.startsWith('data:image/')) {
+    if (!/^data:image\/(jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(value)) {
+      return 'INVALID';
+    }
+    if (value.length > 500000) return 'INVALID';
+    return value;
+  }
+  if (value.startsWith('https://') && value.length <= 2048) {
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol === 'https:') return value;
+    } catch {
+      return 'INVALID';
+    }
+  }
+  return 'INVALID';
 }
 
 // Crypto helpers
@@ -229,6 +367,22 @@ function normalizeIndianPhone(raw: string): string | null {
     return `+91${digits}`;
   }
   if (digits.length === 12 && digits.startsWith('91') && /^[6-9]\d{9}$/.test(digits.slice(2))) {
+    return `+${digits}`;
+  }
+  return null;
+}
+
+// Accepts any valid E.164 phone number verified by Firebase Auth (including Firebase Console test numbers)
+function normalizeE164Phone(raw: string): string | null {
+  const trimmed = raw.trim().replace(/[\s\-()]/g, '');
+  if (/^\+[1-9]\d{6,14}$/.test(trimmed)) {
+    return trimmed;
+  }
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length === 10) {
+    return `+91${digits}`;
+  }
+  if (digits.length === 12 && digits.startsWith('91')) {
     return `+${digits}`;
   }
   return null;
@@ -453,27 +607,67 @@ function setSessionCookie(res: Response, token: string) {
   const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
   res.setHeader(
     'Set-Cookie',
-    `cb_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${maxAgeSec}`
+    `cb_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=${maxAgeSec}`
   );
 }
 
 function clearSessionCookie(res: Response) {
-  res.setHeader('Set-Cookie', 'cb_session=; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=0');
+  res.setHeader('Set-Cookie', 'cb_session=; Path=/; HttpOnly; SameSite=None; Secure; Partitioned; Max-Age=0');
+}
+
+function createCashBridgeSession(res: Response, userId: string): string {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)').run(
+    token,
+    userId,
+    expiresAt,
+    now
+  );
+  db.prepare('UPDATE users SET is_online = 1, last_active_at = ? WHERE uid = ?').run(now, userId);
+  setSessionCookie(res, token);
+  return token;
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1.5mb' }));
 
-  // Public runtime configuration (Google Maps key + Firebase env status + Admin limits)
+  // CSRF protection for cookie-authenticated state-changing API requests
+  app.use('/api', (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      next();
+      return;
+    }
+    const hasBearer = Boolean(req.headers.authorization?.startsWith('Bearer '));
+    const hasCustomHeader = req.headers['x-requested-with'] === 'CashBridge';
+    const hasCookie = Boolean(req.headers.cookie?.includes('cb_session='));
+    if (hasCookie && !hasBearer && !hasCustomHeader) {
+      const origin = req.headers.origin;
+      const host = req.headers.host;
+      let originAllowed = false;
+      if (origin && host) {
+        try {
+          originAllowed = new URL(origin).host === host;
+        } catch {
+          originAllowed = false;
+        }
+      }
+      if (!originAllowed) {
+        res.status(403).json({ error: 'Cross-site request rejected.' });
+        return;
+      }
+    }
+    next();
+  });
+
+  // Public runtime configuration (Google Maps key + Firebase config status + Admin limits)
   app.get('/api/config/public', (_req, res) => {
     const mapsApiKey = process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY || '';
-    const firebaseConfigured = Boolean(
-      process.env.VITE_FIREBASE_API_KEY && process.env.VITE_FIREBASE_PROJECT_ID
-    );
     res.json({
       mapsApiKey,
-      firebaseConfigured,
+      firebaseConfigured: true,
       platformConfig: getPlatformConfig(),
     });
   });
@@ -678,6 +872,285 @@ async function startServer() {
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.uid);
     logAudit(user.uid, 'password_reset', 'User reset password via DOB verification');
     res.json({ ok: true, message: 'Password updated successfully. Please sign in with your new password.' });
+  });
+
+  // Real Firebase Authentication Session Exchange (Email/Password, Phone OTP, Google Sign-In)
+  app.post('/api/auth/firebase', async (req, res) => {
+    const { idToken } = req.body || {};
+    if (!idToken || typeof idToken !== 'string') {
+      res.status(400).json({ error: 'Firebase authentication token is required.' });
+      return;
+    }
+
+    let verified: VerifiedFirebaseToken;
+    try {
+      verified = await verifyFirebaseIdToken(idToken);
+    } catch (err: any) {
+      res.status(401).json({ error: err.message || 'Invalid Firebase authentication token.' });
+      return;
+    }
+
+    // 1. Primary lookup by verified firebase_uid
+    let user = db
+      .prepare('SELECT * FROM users WHERE firebase_uid = ?')
+      .get(verified.uid) as any;
+
+    // 2. Link existing unlinked CashBridge user by cryptographically verified phone or email
+    if (!user && verified.phoneNumber) {
+      const normalizedPhone = normalizeE164Phone(verified.phoneNumber);
+      if (normalizedPhone) {
+        const byPhone = db
+          .prepare('SELECT * FROM users WHERE phone_number = ?')
+          .get(normalizedPhone) as any;
+        if (byPhone && (!byPhone.firebase_uid || byPhone.firebase_uid === verified.uid)) {
+          db.prepare('UPDATE users SET firebase_uid = ?, mobile_verified = 1, is_verified = 1 WHERE uid = ?').run(
+            verified.uid,
+            byPhone.uid
+          );
+          user = db.prepare('SELECT * FROM users WHERE uid = ?').get(byPhone.uid);
+        }
+      }
+    }
+
+    if (!user && verified.email) {
+      const byEmail = db
+        .prepare('SELECT * FROM users WHERE email = ?')
+        .get(verified.email) as any;
+      if (byEmail && (!byEmail.firebase_uid || byEmail.firebase_uid === verified.uid)) {
+        const shouldPromoteAdmin = verified.email === ADMIN_BOOTSTRAP_EMAIL;
+        db.prepare(
+          'UPDATE users SET firebase_uid = ?, role = CASE WHEN ? = 1 THEN \'admin\' ELSE role END WHERE uid = ?'
+        ).run(verified.uid, shouldPromoteAdmin ? 1 : 0, byEmail.uid);
+        user = db.prepare('SELECT * FROM users WHERE uid = ?').get(byEmail.uid);
+      }
+    }
+
+    // 3. Auto-provision verified Firebase Phone OTP users so they redirect straight to the CashBridge dashboard
+    if (!user && verified.phoneNumber) {
+      const normalizedPhone = normalizeE164Phone(verified.phoneNumber);
+      if (normalizedPhone) {
+        const uid = newId('usr');
+        const now = new Date().toISOString();
+        const phoneSuffix = normalizedPhone.slice(-4);
+        const defaultName = verified.name || `Member ${phoneSuffix}`;
+        const placeholderHash = hashPassword(crypto.randomBytes(32).toString('hex'));
+
+        db.prepare(`
+          INSERT INTO users (
+            uid, firebase_uid, name, phone_number, email, password_hash, profile_image, date_of_birth,
+            age_confirmed_18, terms_accepted_at, is_verified, mobile_verified, kyc_status,
+            role, is_suspended, is_online, location_sharing_enabled, created_at, last_active_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 1, 'none', 'user', 0, 1, 1, ?, ?)
+        `).run(
+          uid,
+          verified.uid,
+          defaultName,
+          normalizedPhone,
+          verified.email,
+          placeholderHash,
+          validateSafeProfileImage(verified.picture) === 'INVALID' ? null : verified.picture,
+          '1995-01-01',
+          now,
+          now,
+          now
+        );
+
+        createNotification(
+          uid,
+          'verification',
+          'Welcome to CashBridge',
+          'Your mobile number is verified via Firebase Phone OTP. Update your display name anytime in Profile and enable GPS to discover nearby exchange requests.',
+          null
+        );
+        logAudit(uid, 'firebase_phone_login', `Provisioned verified Phone OTP account (${normalizedPhone})`);
+        user = db.prepare('SELECT * FROM users WHERE uid = ?').get(uid);
+      }
+    }
+
+    if (!user) {
+      res.json({
+        status: 'needs_onboarding',
+        firebaseUser: {
+          uid: verified.uid,
+          email: verified.email,
+          phoneNumber: verified.phoneNumber,
+          displayName: verified.name,
+          photoURL: verified.picture,
+          signInProvider: verified.signInProvider,
+        },
+      });
+      return;
+    }
+
+    if (user.is_suspended) {
+      res.status(403).json({
+        error: 'This account is currently suspended. Contact an administrator for reinstatement.',
+        code: 'ACCOUNT_SUSPENDED',
+      });
+      return;
+    }
+
+    const token = createCashBridgeSession(res, user.uid);
+    const fresh = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid);
+    res.json({
+      status: 'authenticated',
+      token,
+      user: serializePrivateUser(fresh),
+    });
+  });
+
+  // Complete 18+ CashBridge Profile after Real Firebase Authentication
+  app.post('/api/auth/firebase/complete-profile', async (req, res) => {
+    const {
+      idToken,
+      name,
+      phoneNumber,
+      email,
+      dateOfBirth,
+      profileImage,
+      termsAccepted,
+      ageConfirmed18,
+    } = req.body || {};
+
+    if (!idToken || typeof idToken !== 'string') {
+      res.status(400).json({ error: 'Firebase authentication token is required.' });
+      return;
+    }
+
+    let verified: VerifiedFirebaseToken;
+    try {
+      verified = await verifyFirebaseIdToken(idToken);
+    } catch (err: any) {
+      res.status(401).json({ error: err.message || 'Invalid Firebase authentication token.' });
+      return;
+    }
+
+    // If profile already exists for this Firebase UID, sign in directly
+    const existingByUid = db
+      .prepare('SELECT * FROM users WHERE firebase_uid = ?')
+      .get(verified.uid) as any;
+    if (existingByUid) {
+      if (existingByUid.is_suspended) {
+        res.status(403).json({
+          error: 'This account is currently suspended.',
+          code: 'ACCOUNT_SUSPENDED',
+        });
+        return;
+      }
+      const token = createCashBridgeSession(res, existingByUid.uid);
+      const fresh = db.prepare('SELECT * FROM users WHERE uid = ?').get(existingByUid.uid);
+      res.json({ status: 'authenticated', token, user: serializePrivateUser(fresh) });
+      return;
+    }
+
+    const cleanName = String(name || verified.name || '').trim();
+    if (cleanName.length < 2 || cleanName.length > 80) {
+      res.status(400).json({ error: 'Full name must be between 2 and 80 characters.' });
+      return;
+    }
+
+    // Prefer Firebase-verified phone number when present (Phone OTP)
+    const rawPhone = verified.phoneNumber || String(phoneNumber || '');
+    const normalizedPhone = verified.phoneNumber
+      ? normalizeE164Phone(verified.phoneNumber)
+      : normalizeIndianPhone(rawPhone);
+    if (!normalizedPhone) {
+      res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number (+91).' });
+      return;
+    }
+
+    // Prefer Firebase-verified email when present (Email/Password or Google)
+    const cleanEmail =
+      verified.email ||
+      (email && String(email).trim() ? String(email).trim().toLowerCase() : null);
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      res.status(400).json({ error: 'Enter a valid email address or leave it blank.' });
+      return;
+    }
+
+    if (!dateOfBirth || !isAtLeast18(String(dateOfBirth))) {
+      res.status(400).json({ error: 'You must be at least 18 years old to register on CashBridge.' });
+      return;
+    }
+    if (!termsAccepted || !ageConfirmed18) {
+      res.status(400).json({ error: 'You must confirm you are 18+ and accept the Terms & Privacy Policy.' });
+      return;
+    }
+
+    const safeImage = validateSafeProfileImage(profileImage ?? verified.picture ?? null);
+    if (safeImage === 'INVALID') {
+      res.status(400).json({ error: 'Profile photo must be a valid image smaller than 350 KB.' });
+      return;
+    }
+
+    const dupPhone = db.prepare('SELECT uid FROM users WHERE phone_number = ?').get(normalizedPhone);
+    if (dupPhone) {
+      res.status(409).json({
+        error: 'An account with this +91 mobile number already exists. Sign in with your existing method.',
+      });
+      return;
+    }
+    if (cleanEmail) {
+      const dupEmail = db.prepare('SELECT uid FROM users WHERE email = ?').get(cleanEmail);
+      if (dupEmail) {
+        res.status(409).json({
+          error: 'An account with this email address already exists. Sign in with your existing method.',
+        });
+        return;
+      }
+    }
+
+    const uid = newId('usr');
+    const now = new Date().toISOString();
+    const isBootstrapAdmin = Boolean(verified.email && verified.email === ADMIN_BOOTSTRAP_EMAIL);
+    const role = isBootstrapAdmin ? 'admin' : 'user';
+    const mobileVerified = verified.phoneNumber ? 1 : 0;
+    const isVerified = verified.phoneNumber || verified.emailVerified || isBootstrapAdmin ? 1 : 0;
+
+    // Non-guessable random password hash placeholder since auth is delegated to Firebase Auth
+    const placeholderHash = hashPassword(crypto.randomBytes(32).toString('hex'));
+
+    db.prepare(`
+      INSERT INTO users (
+        uid, firebase_uid, name, phone_number, email, password_hash, profile_image, date_of_birth,
+        age_confirmed_18, terms_accepted_at, is_verified, mobile_verified, kyc_status,
+        role, is_suspended, is_online, location_sharing_enabled, created_at, last_active_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'none', ?, 0, 1, 1, ?, ?)
+    `).run(
+      uid,
+      verified.uid,
+      cleanName,
+      normalizedPhone,
+      cleanEmail,
+      placeholderHash,
+      safeImage,
+      String(dateOfBirth),
+      now,
+      isVerified,
+      mobileVerified,
+      role,
+      now,
+      now
+    );
+
+    const token = createCashBridgeSession(res, uid);
+    createNotification(
+      uid,
+      'verification',
+      'Welcome to CashBridge',
+      isBootstrapAdmin
+        ? 'Your Firebase-authenticated account is active with Administrator privileges. Remember to verify payments independently in your official UPI/bank app.'
+        : 'Your Firebase-authenticated account is active. Enable GPS location to discover nearby cash and digital money exchange requests within 1 KM.',
+      null
+    );
+    logAudit(uid, 'firebase_register', `Registered via Firebase (${verified.signInProvider})`);
+
+    const created = db.prepare('SELECT * FROM users WHERE uid = ?').get(uid);
+    res.status(201).json({
+      status: 'authenticated',
+      token,
+      user: serializePrivateUser(created),
+    });
   });
 
   app.post('/api/auth/logout', (req: AuthedRequest, res) => {

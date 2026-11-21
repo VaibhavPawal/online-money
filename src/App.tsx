@@ -22,10 +22,11 @@ import {
   UserProfile,
 } from './types';
 import { apiRequest, getStoredToken, setStoredToken } from './lib/api';
+import { auth, isAuthFlowBusy, onAuthStateChanged, signOut } from './lib/firebase';
 import { useGeolocation } from './hooks/useGeolocation';
 import { BrandLogo } from './components/BrandLogo';
 import { LandingPage } from './components/LandingPage';
-import { AuthScreen } from './components/AuthScreen';
+import { AuthScreen, type PendingFirebaseOnboarding } from './components/AuthScreen';
 import { DashboardView } from './components/DashboardView';
 import { NearbyView } from './components/NearbyView';
 import { RequestsConnectionsView } from './components/RequestsConnectionsView';
@@ -50,12 +51,14 @@ const DEFAULT_CONFIG: PlatformConfig = {
 export default function App() {
   const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
   const [mapsApiKey, setMapsApiKey] = useState<string>(import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '');
-  const [firebaseConfigured, setFirebaseConfigured] = useState(false);
   const [platformConfig, setPlatformConfig] = useState<PlatformConfig>(DEFAULT_CONFIG);
 
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [authScreenMode, setAuthScreenMode] = useState<'landing' | 'login' | 'register'>('landing');
+  const [pendingOnboarding, setPendingOnboarding] = useState<PendingFirebaseOnboarding | null>(null);
+  const userRef = useRef<UserProfile | null>(null);
+  userRef.current = user;
 
   const [activeTab, setActiveTab] = useState<AppNavTab>('home');
   const [radiusMeters, setRadiusMeters] = useState<number>(1000);
@@ -97,22 +100,62 @@ export default function App() {
     return () => window.removeEventListener('gmp-quota-exceeded', handler);
   }, []);
 
-  // Load public config and restore authenticated session on mount
+  // Load public config and restore Firebase-authenticated session on mount
   useEffect(() => {
     let active = true;
-    (async () => {
-      try {
-        const cfg = await apiRequest<PublicConfigResponse>('/api/config/public');
-        if (active) {
-          if (cfg.mapsApiKey) setMapsApiKey(cfg.mapsApiKey);
-          setFirebaseConfigured(cfg.firebaseConfigured);
-          setPlatformConfig(cfg.platformConfig);
-          setRadiusMeters(cfg.platformConfig.defaultRadius || 1000);
-        }
-      } catch {
+
+    apiRequest<PublicConfigResponse>('/api/config/public')
+      .then((cfg) => {
+        if (!active) return;
+        if (cfg.mapsApiKey) setMapsApiKey(cfg.mapsApiKey);
+        setPlatformConfig(cfg.platformConfig);
+        setRadiusMeters(cfg.platformConfig.defaultRadius || 1000);
+      })
+      .catch(() => {
         // Use fallback defaults
+      });
+
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (!active) return;
+
+      // If AuthScreen is actively handling sign-in/registration or user is already loaded, skip duplicate exchange
+      if (isAuthFlowBusy() || (fbUser && userRef.current)) {
+        setAuthLoading(false);
+        return;
       }
 
+      if (fbUser) {
+        try {
+          const idToken = await fbUser.getIdToken();
+          const res = await apiRequest<
+            | { status: 'authenticated'; token: string; user: UserProfile }
+            | { status: 'needs_onboarding'; firebaseUser: PendingFirebaseOnboarding }
+          >('/api/auth/firebase', {
+            method: 'POST',
+            body: JSON.stringify({ idToken }),
+          });
+          if (!active) return;
+          if (res.status === 'authenticated') {
+            setStoredToken(res.token);
+            setUser(res.user);
+            setPendingOnboarding(null);
+          } else {
+            // Only open onboarding automatically if user isn't mid-registration in AuthScreen
+            setPendingOnboarding(res.firebaseUser);
+            setAuthScreenMode('register');
+          }
+        } catch {
+          if (active) {
+            setUser(null);
+            setPendingOnboarding(null);
+          }
+        } finally {
+          if (active) setAuthLoading(false);
+        }
+        return;
+      }
+
+      // No active Firebase user: check existing HttpOnly session cookie if any
       try {
         const me = await apiRequest<{ user: UserProfile; platformConfig: PlatformConfig }>('/api/auth/me');
         if (active) {
@@ -124,9 +167,11 @@ export default function App() {
       } finally {
         if (active) setAuthLoading(false);
       }
-    })();
+    });
+
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
 
@@ -249,11 +294,15 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await apiRequest('/api/auth/logout', { method: 'POST' });
+      await Promise.allSettled([
+        signOut(auth),
+        apiRequest('/api/auth/logout', { method: 'POST' }),
+      ]);
     } catch {
       // Proceed to clear local session
     }
     setStoredToken(null);
+    setPendingOnboarding(null);
     setUser(null);
     setAuthScreenMode('landing');
     setActiveTab('home');
@@ -341,14 +390,22 @@ export default function App() {
     return (
       <>
         {quotaBanner}
-        {authScreenMode === 'landing' ? (
+        {authScreenMode === 'landing' && !pendingOnboarding ? (
           <LandingPage onOpenAuth={(m) => setAuthScreenMode(m)} />
         ) : (
           <AuthScreen
-            initialMode={authScreenMode}
-            firebaseConfigured={firebaseConfigured}
-            onBack={() => setAuthScreenMode('landing')}
+            initialMode={authScreenMode === 'landing' ? 'register' : authScreenMode}
+            pendingOnboarding={pendingOnboarding}
+            onCancelOnboarding={() => {
+              setPendingOnboarding(null);
+              setAuthScreenMode('login');
+            }}
+            onBack={() => {
+              setPendingOnboarding(null);
+              setAuthScreenMode('landing');
+            }}
             onSuccess={(u) => {
+              setPendingOnboarding(null);
               setUser(u);
               setGpsPromptDismissed(false);
               setActiveTab('home');

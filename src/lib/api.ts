@@ -1,23 +1,13 @@
-const TOKEN_KEY = 'cashbridge_session_token';
+// Store CashBridge session token in memory only (avoiding localStorage exposure);
+// Firebase Auth persists user sessions securely and re-hydrates sessions on reload.
+let inMemoryToken: string | null = null;
 
 export function getStoredToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
+  return inMemoryToken;
 }
 
 export function setStoredToken(token: string | null) {
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
-    }
-  } catch {
-    // Ignore storage errors in private browsing
-  }
+  inMemoryToken = token;
 }
 
 export class ApiError extends Error {
@@ -37,6 +27,7 @@ export async function apiRequest<T = any>(
   const token = getStoredToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-Requested-With': 'CashBridge',
     ...(options.headers as Record<string, string> | undefined),
   };
   if (token) {
